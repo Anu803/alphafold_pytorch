@@ -176,3 +176,202 @@ def plot_contact_map(target, mats, out):
     else:
         fig.suptitle(target, fontsize=20)
         plt.savefig(out, dpi=300, bbox_inches='tight', pad_inches=0.5)
+        #@title Run AlphaFold and download prediction
+
+#@markdown Once this cell has been executed, a zip-archive with 
+#@markdown the obtained prediction will be automatically downloaded 
+#@markdown to your computer.
+
+# --- Run the model ---
+model_names = ['model_1', 'model_2', 'model_3', 'model_4', 'model_5', 'model_2_ptm']
+
+def _placeholder_template_feats(num_templates_, num_res_):
+  return {
+      'template_aatype': np.zeros([num_templates_, num_res_, 22], np.float32),
+      'template_all_atom_masks': np.zeros([num_templates_, num_res_, 37, 3], np.float32),
+      'template_all_atom_positions': np.zeros([num_templates_, num_res_, 37], np.float32),
+      'template_domain_names': np.zeros([num_templates_], np.float32),
+      'template_sum_probs': np.zeros([num_templates_], np.float32),
+  }
+
+output_dir = 'prediction'
+os.makedirs(output_dir, exist_ok=True)
+
+plddts = {}
+pae_outputs = {}
+unrelaxed_proteins = {}
+
+with tqdm.notebook.tqdm(total=len(model_names) + 1, bar_format=TQDM_BAR_FORMAT) as pbar:
+  for model_name in model_names:
+    pbar.set_description(f'Running {model_name}')
+    num_templates = 0
+    num_res = len(sequence)
+
+    feature_dict = {}
+    feature_dict.update(pipeline.make_sequence_features(sequence, 'test', num_res))
+    feature_dict.update(pipeline.make_msa_features(msas, deletion_matrices=deletion_matrices))
+    feature_dict.update(_placeholder_template_feats(num_templates, num_res))
+
+    cfg = config.model_config(model_name)
+    params = data.get_model_haiku_params(model_name, './alphafold/data')
+    model_runner = model.RunModel(cfg, params)
+    processed_feature_dict = model_runner.process_features(feature_dict,
+                                                           random_seed=0)
+    prediction_result = model_runner.predict(processed_feature_dict)
+
+    mean_plddt = prediction_result['plddt'].mean()
+
+    if 'predicted_aligned_error' in prediction_result:
+      pae_outputs[model_name] = (
+          prediction_result['predicted_aligned_error'],
+          prediction_result['max_predicted_aligned_error']
+      )
+    else:
+      # Get the pLDDT confidence metrics. Do not put pTM models here as they
+      # should never get selected.
+      plddts[model_name] = prediction_result['plddt']
+
+    # Set the b-factors to the per-residue plddt.
+    final_atom_mask = prediction_result['structure_module']['final_atom_mask']
+    b_factors = prediction_result['plddt'][:, None] * final_atom_mask
+    unrelaxed_protein = protein.from_prediction(processed_feature_dict,
+                                                prediction_result,
+                                                b_factors=b_factors)
+    unrelaxed_proteins[model_name] = unrelaxed_protein
+
+    # Delete unused outputs to save memory.
+    del model_runner
+    del params
+    del prediction_result
+    pbar.update(n=1)
+
+  # --- AMBER relax the best model ---
+  pbar.set_description(f'AMBER relaxation')
+  amber_relaxer = relax.AmberRelaxation(
+      max_iterations=0,
+      tolerance=2.39,
+      stiffness=10.0,
+      exclude_residues=[],
+      max_outer_iterations=20)
+  # Find the best model according to the mean pLDDT.
+  best_model_name = max(plddts.keys(), key=lambda x: plddts[x].mean())
+  relaxed_pdb, _, _ = amber_relaxer.process(
+      prot=unrelaxed_proteins[best_model_name])
+  pbar.update(n=1)  # Finished AMBER relax.
+
+# Construct multiclass b-factors to indicate confidence bands
+# 0=very low, 1=low, 2=confident, 3=very high
+banded_b_factors = []
+for plddt in plddts[best_model_name]:
+  for idx, (min_val, max_val, _) in enumerate(PLDDT_BANDS):
+    if plddt >= min_val and plddt <= max_val:
+      banded_b_factors.append(idx)
+      break
+banded_b_factors = np.array(banded_b_factors)[:, None] * final_atom_mask
+to_visualize_pdb = utils.overwrite_b_factors(relaxed_pdb, banded_b_factors)
+
+
+# Write out the prediction
+pred_output_path = os.path.join(output_dir, 'selected_prediction.pdb')
+with open(pred_output_path, 'w') as f:
+  f.write(relaxed_pdb)
+
+
+# --- Visualise the prediction & confidence ---
+show_sidechains = True
+def plot_plddt_legend():
+  """Plots the legend for pLDDT."""
+  thresh = [
+            'Very low (pLDDT < 50)',
+            'Low (70 > pLDDT > 50)',
+            'Confident (90 > pLDDT > 70)',
+            'Very high (pLDDT > 90)']
+
+  colors = [x[2] for x in PLDDT_BANDS]
+
+  plt.figure(figsize=(2, 2))
+  for c in colors:
+    plt.bar(0, 0, color=c)
+  plt.legend(thresh, frameon=False, loc='center', fontsize=20)
+  plt.xticks([])
+  plt.yticks([])
+  ax = plt.gca()
+  ax.spines['right'].set_visible(False)
+  ax.spines['top'].set_visible(False)
+  ax.spines['left'].set_visible(False)
+  ax.spines['bottom'].set_visible(False)
+  plt.title('Model Confidence', fontsize=20, pad=20)
+  return plt
+
+# Color the structure by per-residue pLDDT
+color_map = {i: bands[2] for i, bands in enumerate(PLDDT_BANDS)}
+view = py3Dmol.view(width=800, height=600)
+view.addModelsAsFrames(to_visualize_pdb)
+style = {'cartoon': {
+    'colorscheme': {
+        'prop': 'b',
+        'map': color_map}
+        }}
+if show_sidechains:
+  style['stick'] = {}
+view.setStyle({'model': -1}, style)
+view.zoomTo()
+
+grid = GridspecLayout(1, 2)
+out = Output()
+with out:
+  view.show()
+grid[0, 0] = out
+
+out = Output()
+with out:
+  plot_plddt_legend().show()
+grid[0, 1] = out
+
+display.display(grid)
+
+# Display pLDDT and predicted aligned error (if output by the model).
+if pae_outputs:
+  num_plots = 2
+else:
+  num_plots = 1
+
+plt.figure(figsize=[8 * num_plots, 6])
+plt.subplot(1, num_plots, 1)
+plt.plot(plddts[best_model_name])
+plt.title('Predicted LDDT')
+plt.xlabel('Residue')
+plt.ylabel('pLDDT')
+
+if num_plots == 2:
+  plt.subplot(1, 2, 2)
+  pae, max_pae = list(pae_outputs.values())[0]
+  plt.imshow(pae, vmin=0., vmax=max_pae, cmap='Greens_r')
+  plt.colorbar(fraction=0.046, pad=0.04)
+  plt.title('Predicted Aligned Error')
+  plt.xlabel('Scored residue')
+  plt.ylabel('Aligned residue')
+
+# Save pLDDT and predicted aligned error (if it exists)
+pae_output_path = os.path.join(output_dir, 'predicted_aligned_error.json')
+if pae_outputs:
+  # Save predicted aligned error in the same format as the AF EMBL DB
+  rounded_errors = np.round(pae.astype(np.float64), decimals=1)
+  indices = np.indices((len(rounded_errors), len(rounded_errors))) + 1
+  indices_1 = indices[0].flatten().tolist()
+  indices_2 = indices[1].flatten().tolist()
+  pae_data = json.dumps([{
+      'residue1': indices_1,
+      'residue2': indices_2,
+      'distance': rounded_errors.flatten().tolist(),
+      'max_predicted_aligned_error': max_pae.item()
+  }],
+                        indent=None,
+                        separators=(',', ':'))
+  with open(pae_output_path, 'w') as f:
+    f.write(pae_data)
+
+
+# --- Download the predictions ---
+!zip -q -r {output_dir}.zip {output_dir}
+files.download(f'{output_dir}.zip')
