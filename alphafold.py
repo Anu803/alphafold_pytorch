@@ -236,6 +236,6 @@ if not set(sequence).issubset(aatypes):
 if len(sequence) < MIN_SEQUENCE_LENGTH:
   raise Exception(f'Input sequence is too short: {len(sequence)} amino acids, while the minimum is {MIN_SEQUENCE_LENGTH}')
 if len(sequence) > MAX_SEQUENCE_LENGTH:
-  raise Exception(f'Input sequence is too long: {len(sequence)} amino acids, while the maximum is {MAX_SEQUENCE_LENGTH}. Please use the full AlphaFold system for long sequences.')
+  raise Exception(f'Input sequence is too long: {len(sequence)} amino acids, while the maximum is {MAX_SEQUENCE_LENGTH}. Please use the full AlphaFold system for long sequences.'))
 
 
