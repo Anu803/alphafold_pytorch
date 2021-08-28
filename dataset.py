@@ -534,4 +534,4 @@ plt.title('Per-Residue Count of Non-Gap Amino Acids in the MSA')
 plt.plot(np.sum(msa_arr != aa_map['-'], axis=0), color='black')
 plt.ylabel('Non-Gap Count')
 plt.yticks(range(0, num_alignments + 1, max(1, int(num_alignments / 3))))
-plt.show()
+plt.show();
