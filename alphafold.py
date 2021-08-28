@@ -221,4 +221,21 @@ if __name__ == '__main__':
         print(f'Device: {DEVICE}')
 
         run_eval(TARGET_PATH, MODEL_PATH, REPLICA, OUT_DIR, DEVICE)
+        Enter the amino acid sequence to fold
+        #@title Enter the amino acid sequence to fold ⬇️
+sequence = 'MAAHKGAEHHHKAAEHHEQAAKHHHAAAEHHEKGEHEQAAHHADTAYAHHKHAEEHAAQAAKHDAEHHAPKPH'  #@param {type:"string"}
+
+MIN_SEQUENCE_LENGTH = 16
+MAX_SEQUENCE_LENGTH = 2500
+
+# Remove all whitespaces, tabs and end lines; upper-case
+sequence = sequence.translate(str.maketrans('', '', ' \n\t')).upper()
+aatypes = set('ACDEFGHIKLMNPQRSTVWY')  # 20 standard aatypes
+if not set(sequence).issubset(aatypes):
+  raise Exception(f'Input sequence contains non-amino acid letters: {set(sequence) - aatypes}. AlphaFold only supports 20 standard amino acids as inputs.')
+if len(sequence) < MIN_SEQUENCE_LENGTH:
+  raise Exception(f'Input sequence is too short: {len(sequence)} amino acids, while the minimum is {MIN_SEQUENCE_LENGTH}')
+if len(sequence) > MAX_SEQUENCE_LENGTH:
+  raise Exception(f'Input sequence is too long: {len(sequence)} amino acids, while the maximum is {MAX_SEQUENCE_LENGTH}. Please use the full AlphaFold system for long sequences.')
+
 
