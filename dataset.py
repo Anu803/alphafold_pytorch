@@ -381,3 +381,157 @@ def test():
 
 if __name__ == '__main__':
     test()
+#@title Search against genetic databases
+
+#@markdown Once this cell has been executed, you will see
+#@markdown statistics about the multiple sequence alignment 
+#@markdown (MSA) that will be used by AlphaFold. In particular, 
+#@markdown you’ll see how well each residue is covered by similar 
+#@markdown sequences in the MSA.
+
+# --- Python imports ---
+import sys
+sys.path.append('/opt/conda/lib/python3.7/site-packages')
+
+import os
+os.environ['TF_FORCE_UNIFIED_MEMORY'] = '1'
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '2.0'
+
+from urllib import request
+from concurrent import futures
+from google.colab import files
+import json
+from matplotlib import gridspec
+import matplotlib.pyplot as plt
+import numpy as np
+import py3Dmol
+
+from alphafold.model import model
+from alphafold.model import config
+from alphafold.model import data
+
+from alphafold.data import parsers
+from alphafold.data import pipeline
+from alphafold.data.tools import jackhmmer
+
+from alphafold.common import protein
+
+from alphafold.relax import relax
+from alphafold.relax import utils
+
+from IPython import display
+from ipywidgets import GridspecLayout
+from ipywidgets import Output
+
+# Color bands for visualizing plddt
+PLDDT_BANDS = [(0, 50, '#FF7D45'),
+               (50, 70, '#FFDB13'),
+               (70, 90, '#65CBF3'),
+               (90, 100, '#0053D6')]
+
+# --- Find the closest source ---
+test_url_pattern = 'https://storage.googleapis.com/alphafold-colab{:s}/latest/uniref90_2021_03.fasta.1'
+ex = futures.ThreadPoolExecutor(3)
+def fetch(source):
+  request.urlretrieve(test_url_pattern.format(source))
+  return source
+fs = [ex.submit(fetch, source) for source in ['', '-europe', '-asia']]
+source = None
+for f in futures.as_completed(fs):
+  source = f.result()
+  ex.shutdown()
+  break
+
+# --- Search against genetic databases ---
+with open('target.fasta', 'wt') as f:
+  f.write(f'>query\n{sequence}')
+
+# Run the search against chunks of genetic databases (since the genetic
+# databases don't fit in Colab ramdisk).
+
+jackhmmer_binary_path = '/usr/bin/jackhmmer'
+dbs = []
+
+num_jackhmmer_chunks = {'uniref90': 59, 'smallbfd': 17, 'mgnify': 71}
+total_jackhmmer_chunks = sum(num_jackhmmer_chunks.values())
+with tqdm.notebook.tqdm(total=total_jackhmmer_chunks, bar_format=TQDM_BAR_FORMAT) as pbar:
+  def jackhmmer_chunk_callback(i):
+    pbar.update(n=1)
+
+  pbar.set_description('Searching uniref90')
+  jackhmmer_uniref90_runner = jackhmmer.Jackhmmer(
+      binary_path=jackhmmer_binary_path,
+      database_path=f'https://storage.googleapis.com/alphafold-colab{source}/latest/uniref90_2021_03.fasta',
+      get_tblout=True,
+      num_streamed_chunks=num_jackhmmer_chunks['uniref90'],
+      streaming_callback=jackhmmer_chunk_callback,
+      z_value=135301051)
+  dbs.append(('uniref90', jackhmmer_uniref90_runner.query('target.fasta')))
+
+  pbar.set_description('Searching smallbfd')
+  jackhmmer_smallbfd_runner = jackhmmer.Jackhmmer(
+      binary_path=jackhmmer_binary_path,
+      database_path=f'https://storage.googleapis.com/alphafold-colab{source}/latest/bfd-first_non_consensus_sequences.fasta',
+      get_tblout=True,
+      num_streamed_chunks=num_jackhmmer_chunks['smallbfd'],
+      streaming_callback=jackhmmer_chunk_callback,
+      z_value=65984053)
+  dbs.append(('smallbfd', jackhmmer_smallbfd_runner.query('target.fasta')))
+
+  pbar.set_description('Searching mgnify')
+  jackhmmer_mgnify_runner = jackhmmer.Jackhmmer(
+      binary_path=jackhmmer_binary_path,
+      database_path=f'https://storage.googleapis.com/alphafold-colab{source}/latest/mgy_clusters_2019_05.fasta',
+      get_tblout=True,
+      num_streamed_chunks=num_jackhmmer_chunks['mgnify'],
+      streaming_callback=jackhmmer_chunk_callback,
+      z_value=304820129)
+  dbs.append(('mgnify', jackhmmer_mgnify_runner.query('target.fasta')))
+
+
+# --- Extract the MSAs and visualize ---
+# Extract the MSAs from the Stockholm files.
+# NB: deduplication happens later in pipeline.make_msa_features.
+
+mgnify_max_hits = 501
+
+msas = []
+deletion_matrices = []
+full_msa = []
+for db_name, db_results in dbs:
+  unsorted_results = []
+  for i, result in enumerate(db_results):
+    msa, deletion_matrix, target_names = parsers.parse_stockholm(result['sto'])
+    e_values_dict = parsers.parse_e_values_from_tblout(result['tbl'])
+    e_values = [e_values_dict[t.split('/')[0]] for t in target_names]
+    zipped_results = zip(msa, deletion_matrix, target_names, e_values)
+    if i != 0:
+      # Only take query from the first chunk
+      zipped_results = [x for x in zipped_results if x[2] != 'query']
+    unsorted_results.extend(zipped_results)
+  sorted_by_evalue = sorted(unsorted_results, key=lambda x: x[3])
+  db_msas, db_deletion_matrices, _, _ = zip(*sorted_by_evalue)
+  if db_msas:
+    if db_name == 'mgnify':
+      db_msas = db_msas[:mgnify_max_hits]
+      db_deletion_matrices = db_deletion_matrices[:mgnify_max_hits]
+    full_msa.extend(db_msas)
+    msas.append(db_msas)
+    deletion_matrices.append(db_deletion_matrices)
+    msa_size = len(set(db_msas))
+    print(f'{msa_size} Sequences Found in {db_name}')
+
+deduped_full_msa = list(dict.fromkeys(full_msa))
+total_msa_size = len(deduped_full_msa)
+print(f'\n{total_msa_size} Sequences Found in Total\n')
+
+aa_map = {restype: i for i, restype in enumerate('ABCDEFGHIJKLMNOPQRSTUVWXYZ-')}
+msa_arr = np.array([[aa_map[aa] for aa in seq] for seq in deduped_full_msa])
+num_alignments, num_res = msa_arr.shape
+
+fig = plt.figure(figsize=(12, 3))
+plt.title('Per-Residue Count of Non-Gap Amino Acids in the MSA')
+plt.plot(np.sum(msa_arr != aa_map['-'], axis=0), color='black')
+plt.ylabel('Non-Gap Count')
+plt.yticks(range(0, num_alignments + 1, max(1, int(num_alignments / 3))))
+plt.show()
